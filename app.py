@@ -1,16 +1,13 @@
 import re
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+import easyocr
 
 from PIL import Image, ImageOps, ImageFilter
-from transformers import (
-    CLIPProcessor,
-    CLIPModel,
-    TrOCRProcessor,
-    VisionEncoderDecoderModel,
-)
+from transformers import CLIPProcessor, CLIPModel
 
 
 # ============================================================
@@ -21,7 +18,6 @@ EMBEDDINGS_PATH = "embeddings.npy"
 DATABASE_PATH = "embedding_db.csv"
 
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
-OCR_MODEL_NAME = "microsoft/trocr-base-printed"
 
 DEFAULT_TOP_K = 5
 
@@ -73,20 +69,13 @@ def load_clip():
 @st.cache_resource(show_spinner=False)
 def load_ocr():
 
-    processor = TrOCRProcessor.from_pretrained(
-        OCR_MODEL_NAME
+    # English is enough for most card names in this database.
+    reader = easyocr.Reader(
+        ["en"],
+        gpu=torch.cuda.is_available(),
     )
 
-    model = VisionEncoderDecoderModel.from_pretrained(
-        OCR_MODEL_NAME
-    )
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model = model.to(device)
-    model.eval()
-
-    return processor, model, device
+    return reader
 
 
 # ============================================================
@@ -127,7 +116,7 @@ def load_database():
 
 
 # ============================================================
-# IMAGE PREPARATION
+# PREPARE IMAGE
 # ============================================================
 
 def prepare_card_image(image):
@@ -136,12 +125,10 @@ def prepare_card_image(image):
 
     width, height = image.size
 
-    # Remove a small amount of background around the card.
     crop = 0.04
 
     left = int(width * crop)
     top = int(height * crop)
-
     right = int(width * (1 - crop))
     bottom = int(height * (1 - crop))
 
@@ -160,57 +147,6 @@ def prepare_card_image(image):
 
 
 # ============================================================
-# FIND CARD NAME REGION
-# ============================================================
-
-def get_name_crops(image):
-
-    image = prepare_card_image(
-        image
-    )
-
-    width, height = image.size
-
-    crops = []
-
-    # --------------------------------------------------------
-    # Main top area.
-    # --------------------------------------------------------
-
-    top_crop = image.crop(
-        (
-            0,
-            0,
-            width,
-            int(height * 0.20),
-        )
-    )
-
-    crops.append(
-        top_crop
-    )
-
-    # --------------------------------------------------------
-    # Slightly larger top area.
-    # --------------------------------------------------------
-
-    top_crop_2 = image.crop(
-        (
-            0,
-            0,
-            width,
-            int(height * 0.27),
-        )
-    )
-
-    crops.append(
-        top_crop_2
-    )
-
-    return crops
-
-
-# ============================================================
 # OCR
 # ============================================================
 
@@ -218,13 +154,13 @@ def clean_ocr_text(text):
 
     text = text.replace(
         "\n",
-        " "
+        " ",
     )
 
     text = re.sub(
         r"\s+",
         " ",
-        text
+        text,
     )
 
     return text.strip()
@@ -232,84 +168,107 @@ def clean_ocr_text(text):
 
 def read_card_name(
     image,
-    ocr_processor,
-    ocr_model,
-    device,
+    reader,
 ):
 
-    crops = get_name_crops(
+    image = prepare_card_image(
         image
     )
 
-    results = []
+    width, height = image.size
 
-    for crop in crops:
+    # Yu-Gi-Oh! card names are normally
+    # located near the top.
+    crop = image.crop(
+        (
+            0,
+            0,
+            width,
+            int(height * 0.25),
+        )
+    )
 
-        # Upscale the name region.
-        scale = 3
+    # Upscale for OCR.
+    scale = 3
 
-        crop = crop.resize(
-            (
-                crop.width * scale,
-                crop.height * scale,
-            )
+    crop = crop.resize(
+        (
+            crop.width * scale,
+            crop.height * scale,
+        )
+    )
+
+    crop = ImageOps.autocontrast(
+        crop
+    )
+
+    crop = crop.filter(
+        ImageFilter.SHARPEN
+    )
+
+    # Convert to numpy.
+    image_array = np.array(
+        crop
+    )
+
+    try:
+
+        detections = reader.readtext(
+            image_array,
+            detail=1,
+            paragraph=False,
         )
 
-        # Improve contrast.
-        crop = ImageOps.autocontrast(
-            crop
-        )
+    except Exception:
 
-        crop = crop.filter(
-            ImageFilter.SHARPEN
-        )
-
-        try:
-
-            pixel_values = ocr_processor(
-                images=crop,
-                return_tensors="pt",
-            ).pixel_values
-
-            pixel_values = pixel_values.to(
-                device
-            )
-
-            with torch.no_grad():
-
-                generated_ids = ocr_model.generate(
-                    pixel_values,
-                    max_new_tokens=64,
-                )
-
-            text = ocr_processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True,
-            )[0]
-
-            text = clean_ocr_text(
-                text
-            )
-
-            if text:
-
-                results.append(
-                    text
-                )
-
-        except Exception:
-            continue
-
-    if not results:
         return ""
 
-    # Prefer the longest useful OCR result.
-    results.sort(
-        key=len,
+
+    if not detections:
+
+        return ""
+
+
+    candidates = []
+
+    for detection in detections:
+
+        if len(detection) < 2:
+            continue
+
+        text = clean_ocr_text(
+            detection[1]
+        )
+
+        confidence = float(
+            detection[2]
+        ) if len(detection) > 2 else 0
+
+        if text and confidence >= 0.20:
+
+            candidates.append(
+                (
+                    text,
+                    confidence,
+                )
+            )
+
+
+    if not candidates:
+
+        return ""
+
+
+    # Prefer high-confidence text.
+    candidates.sort(
+        key=lambda x: (
+            x[1],
+            len(x[0]),
+        ),
         reverse=True,
     )
 
-    return results[0]
+    return candidates[0][0]
 
 
 # ============================================================
@@ -319,6 +278,7 @@ def read_card_name(
 def normalize_text(text):
 
     if pd.isna(text):
+
         return ""
 
     text = str(text).lower()
@@ -356,16 +316,22 @@ def text_similarity(
     )
 
     if not query or not candidate:
+
         return 0.0
 
+    # Exact match.
     if query == candidate:
+
         return 1.0
 
-    # Exact phrase.
+    # Query contained inside candidate.
     if query in candidate:
+
         return 0.95
 
+    # Candidate contained inside query.
     if candidate in query:
+
         return 0.90
 
     query_words = set(
@@ -377,6 +343,7 @@ def text_similarity(
     )
 
     if not query_words:
+
         return 0.0
 
     overlap = len(
@@ -386,12 +353,15 @@ def text_similarity(
     )
 
     return float(
-        min(overlap, 1.0)
+        min(
+            overlap,
+            1.0,
+        )
     )
 
 
 # ============================================================
-# CLIP EMBEDDING
+# CLIP IMAGE ENCODING
 # ============================================================
 
 def encode_clip_image(
@@ -457,7 +427,7 @@ def encode_card(
     width, height = image.size
 
     views = [
-        image,
+        image
     ]
 
     # Small crop.
@@ -474,7 +444,7 @@ def encode_card(
         )
     )
 
-    # Stronger crop.
+    # Larger crop.
     crop = 0.10
 
     views.append(
@@ -540,15 +510,13 @@ def search_cards(
         device,
     )
 
+    # Visual similarity.
     clip_scores = (
         database_embeddings
         @ query_embedding
     )
 
-    # --------------------------------------------------------
-    # OCR score.
-    # --------------------------------------------------------
-
+    # OCR similarity.
     if ocr_text:
 
         ocr_scores = np.array(
@@ -570,10 +538,10 @@ def search_cards(
         )
 
     # --------------------------------------------------------
-    # Hybrid score.
+    # Hybrid scoring.
     #
-    # CLIP remains the main signal.
-    # OCR is used as a strong secondary signal.
+    # CLIP = 65%
+    # OCR  = 35%
     # --------------------------------------------------------
 
     if ocr_text:
@@ -586,10 +554,6 @@ def search_cards(
     else:
 
         final_scores = clip_scores
-
-    # --------------------------------------------------------
-    # Get more candidates than we display.
-    # --------------------------------------------------------
 
     candidate_count = min(
         top_k * 5,
@@ -647,6 +611,7 @@ def search_cards(
         )
 
         if len(results) >= top_k:
+
             break
 
     return results
@@ -662,6 +627,7 @@ def confidence_label(
 ):
 
     if not results:
+
         return (
             "🔴 No match",
             "No suitable card was found.",
@@ -730,7 +696,7 @@ def confidence_label(
 
 
 # ============================================================
-# LOAD MODELS/DATABASE
+# LOAD EVERYTHING
 # ============================================================
 
 try:
@@ -743,9 +709,7 @@ try:
             load_clip()
         )
 
-        ocr_processor, ocr_model, ocr_device = (
-            load_ocr()
-        )
+        ocr_reader = load_ocr()
 
         database_embeddings, metadata = (
             load_database()
@@ -775,7 +739,7 @@ with st.sidebar:
     )
 
     top_k = st.slider(
-        "Results",
+        "Number of results",
         3,
         10,
         DEFAULT_TOP_K,
@@ -784,7 +748,8 @@ with st.sidebar:
     st.divider()
 
     st.write(
-        f"**Cards:** {len(metadata):,}"
+        f"**Cards indexed:** "
+        f"{len(metadata):,}"
     )
 
     st.write(
@@ -793,18 +758,13 @@ with st.sidebar:
     )
 
     st.write(
-        f"**CLIP device:** `{device}`"
-    )
-
-    st.write(
-        f"**OCR device:** `{ocr_device}`"
+        f"**Device:** `{device}`"
     )
 
     st.divider()
 
     st.caption(
-        "Matching combines card-name OCR "
-        "with visual CLIP similarity."
+        "Uses card-name OCR + visual CLIP matching."
     )
 
 
@@ -843,15 +803,16 @@ if uploaded_file:
 
         st.stop()
 
+
     # --------------------------------------------------------
-    # Show upload.
+    # Uploaded image.
     # --------------------------------------------------------
 
-    col1, col2 = st.columns(
+    image_col, info_col = st.columns(
         [1, 2]
     )
 
-    with col1:
+    with image_col:
 
         st.subheader(
             "📷 Uploaded card"
@@ -861,6 +822,7 @@ if uploaded_file:
             image,
             width=280,
         )
+
 
     # --------------------------------------------------------
     # OCR.
@@ -872,36 +834,36 @@ if uploaded_file:
 
         ocr_text = read_card_name(
             image,
-            ocr_processor,
-            ocr_model,
-            ocr_device,
+            ocr_reader,
         )
 
-    with col2:
+
+    with info_col:
 
         st.subheader(
-            "🔤 OCR"
+            "🔤 Card name detection"
         )
 
         if ocr_text:
 
             st.success(
-                f"Detected text: **{ocr_text}**"
+                f"Detected: **{ocr_text}**"
             )
 
         else:
 
             st.warning(
-                "Could not confidently read the card name. "
-                "Using visual matching instead."
+                "Could not read the card name. "
+                "Using visual matching."
             )
 
+
     # --------------------------------------------------------
-    # Search.
+    # SEARCH.
     # --------------------------------------------------------
 
     with st.spinner(
-        "Comparing artwork + card name..."
+        "Comparing card artwork and name..."
     ):
 
         results = search_cards(
@@ -915,22 +877,29 @@ if uploaded_file:
             top_k,
         )
 
+
     if not results:
 
         st.error(
-            "No matches found."
+            "No matching cards found."
         )
 
         st.stop()
+
 
     label, explanation = confidence_label(
         results,
         ocr_text,
     )
 
+
+    # ========================================================
+    # BEST MATCH
+    # ========================================================
+
     st.divider()
 
-    st.subheader(
+    st.header(
         "🎯 Best Match"
     )
 
@@ -940,11 +909,12 @@ if uploaded_file:
 
     best = results[0]
 
-    best_col1, best_col2 = st.columns(
+    best_image_col, best_info_col = st.columns(
         [1, 2]
     )
 
-    with best_col1:
+
+    with best_image_col:
 
         image_url = best[
             "image_url"
@@ -976,7 +946,8 @@ if uploaded_file:
                     "Card image unavailable."
                 )
 
-    with best_col2:
+
+    with best_info_col:
 
         st.markdown(
             f"## {best['name']}"
@@ -1015,20 +986,21 @@ if uploaded_file:
                 best["desc"]
             )
 
+
     # ========================================================
     # ALTERNATIVES
     # ========================================================
 
     st.divider()
 
-    st.subheader(
+    st.header(
         "🔎 Other likely matches"
     )
 
     st.caption(
-        "The correct card may be below the first result "
-        "if the photograph is blurry, cropped, or reflective."
+        "If the first result is wrong, check these alternatives."
     )
+
 
     columns = st.columns(
         min(
@@ -1036,6 +1008,7 @@ if uploaded_file:
             len(results),
         )
     )
+
 
     for column, result in zip(
         columns,
@@ -1074,6 +1047,7 @@ if uploaded_file:
                         "Image unavailable"
                     )
 
+
             st.markdown(
                 f"**{result['name']}**"
             )
@@ -1095,6 +1069,7 @@ if uploaded_file:
                     f"{result['ocr_score'] * 100:.1f}%"
                 )
 
+
 else:
 
     st.info(
@@ -1103,11 +1078,11 @@ else:
 
     st.markdown(
         """
-        ### For best results
+        ### Tips for best recognition
 
         - Photograph the entire card.
         - Keep the card reasonably straight.
-        - Avoid glare.
+        - Avoid glare/reflections.
         - Make sure the card name is visible.
         - Use good lighting.
         - Avoid fingers covering the card name.

@@ -2,23 +2,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import CLIPProcessor, CLIPModel
 
 
-# =========================
-# Configuration
-# =========================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 EMBEDDINGS_PATH = "embeddings.npy"
 DATABASE_PATH = "embedding_db.csv"
 
 MODEL_NAME = "openai/clip-vit-base-patch32"
 
+TOP_K = 8
 
-# =========================
-# Page
-# =========================
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 
 st.set_page_config(
     page_title="Yu-Gi-Oh! AI Card Finder",
@@ -27,16 +29,17 @@ st.set_page_config(
 )
 
 st.title("🃏 Yu-Gi-Oh! AI Card Finder")
-st.write(
-    "Upload a Yu-Gi-Oh! card image and find the closest matching cards."
+st.caption(
+    "Upload a card photo and find the closest matches "
+    "from the indexed card database."
 )
 
 
-# =========================
-# Load CLIP
-# =========================
+# ============================================================
+# LOAD CLIP MODEL
+# ============================================================
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_model():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,46 +53,136 @@ def load_model():
     return model, processor, device
 
 
-# =========================
-# Load index
-# =========================
+# ============================================================
+# LOAD DATABASE
+# ============================================================
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_database():
 
     embeddings = np.load(EMBEDDINGS_PATH)
-    metadata = pd.read_csv(DATABASE_PATH)
+
+    metadata = pd.read_csv(
+        DATABASE_PATH
+    )
 
     if len(embeddings) != len(metadata):
         raise ValueError(
-            f"Embeddings ({len(embeddings)}) and "
-            f"metadata ({len(metadata)}) do not match."
+            f"Database mismatch: "
+            f"{len(embeddings)} embeddings but "
+            f"{len(metadata)} metadata rows."
         )
 
-    # Make sure embeddings are normalized
+    # Normalize database embeddings.
     norms = np.linalg.norm(
         embeddings,
         axis=1,
         keepdims=True
     )
 
-    embeddings = embeddings / np.maximum(norms, 1e-12)
+    embeddings = embeddings / np.maximum(
+        norms,
+        1e-12
+    )
 
-    return embeddings, metadata
+    return embeddings.astype(np.float32), metadata
 
 
-# =========================
-# Encode uploaded image
-# =========================
+# ============================================================
+# CREATE MULTIPLE VIEWS OF UPLOADED CARD
+# ============================================================
 
-def encode_image(
+def create_card_views(image):
+
+    image = image.convert("RGB")
+
+    width, height = image.size
+
+    views = []
+
+    # --------------------------------------------------------
+    # View 1: original
+    # --------------------------------------------------------
+
+    views.append(image)
+
+    # --------------------------------------------------------
+    # View 2: slightly cropped
+    # Helps remove background/table/sleeve edges.
+    # --------------------------------------------------------
+
+    crop_amount = 0.04
+
+    left = int(width * crop_amount)
+    top = int(height * crop_amount)
+    right = int(width * (1 - crop_amount))
+    bottom = int(height * (1 - crop_amount))
+
+    if right > left and bottom > top:
+
+        views.append(
+            image.crop(
+                (left, top, right, bottom)
+            )
+        )
+
+    # --------------------------------------------------------
+    # View 3: stronger crop
+    # --------------------------------------------------------
+
+    crop_amount = 0.10
+
+    left = int(width * crop_amount)
+    top = int(height * crop_amount)
+    right = int(width * (1 - crop_amount))
+    bottom = int(height * (1 - crop_amount))
+
+    if right > left and bottom > top:
+
+        views.append(
+            image.crop(
+                (left, top, right, bottom)
+            )
+        )
+
+    # --------------------------------------------------------
+    # View 4: square letterboxed version
+    #
+    # This prevents the card from being distorted while
+    # keeping the whole card visible.
+    # --------------------------------------------------------
+
+    max_side = max(width, height)
+
+    square = Image.new(
+        "RGB",
+        (max_side, max_side),
+        "black"
+    )
+
+    x = (max_side - width) // 2
+    y = (max_side - height) // 2
+
+    square.paste(
+        image,
+        (x, y)
+    )
+
+    views.append(square)
+
+    return views
+
+
+# ============================================================
+# CREATE CLIP EMBEDDING
+# ============================================================
+
+def encode_single_image(
     image,
     model,
     processor,
     device
 ):
-
-    image = image.convert("RGB")
 
     inputs = processor(
         images=image,
@@ -103,121 +196,265 @@ def encode_image(
 
     with torch.no_grad():
 
-        embedding = model.get_image_features(
+        features = model.get_image_features(
             **inputs
         )
 
-        if hasattr(embedding, "image_embeds"):
-            embedding = embedding.image_embeds
+        # Some Transformers versions return an object.
+        if hasattr(features, "image_embeds"):
 
-        elif hasattr(embedding, "pooler_output"):
-            embedding = embedding.pooler_output
+            features = features.image_embeds
 
-        embedding = embedding / embedding.norm(
+        elif hasattr(features, "pooler_output"):
+
+            features = features.pooler_output
+
+        # Normalize.
+        features = features / features.norm(
             dim=-1,
             keepdim=True
         )
 
-    return embedding.cpu().numpy()[0]
+    return features[0].cpu().numpy()
 
 
-# =========================
-# Search
-# =========================
+# ============================================================
+# ROBUST QUERY EMBEDDING
+# ============================================================
+
+def encode_card(
+    image,
+    model,
+    processor,
+    device
+):
+
+    views = create_card_views(image)
+
+    embeddings = []
+
+    for view in views:
+
+        embedding = encode_single_image(
+            view,
+            model,
+            processor,
+            device
+        )
+
+        embeddings.append(
+            embedding
+        )
+
+    # --------------------------------------------------------
+    # Average multiple views.
+    # This reduces sensitivity to:
+    # - glare
+    # - background
+    # - borders
+    # - cropping
+    # --------------------------------------------------------
+
+    combined = np.mean(
+        embeddings,
+        axis=0
+    )
+
+    combined = combined / max(
+        np.linalg.norm(combined),
+        1e-12
+    )
+
+    return combined.astype(np.float32)
+
+
+# ============================================================
+# SEARCH
+# ============================================================
 
 def search_cards(
     image,
-    embeddings,
+    database_embeddings,
     metadata,
     model,
     processor,
     device,
-    top_k
+    top_k=TOP_K
 ):
 
-    query_embedding = encode_image(
+    query_embedding = encode_card(
         image,
         model,
         processor,
         device
     )
 
-    # Cosine similarity because vectors are normalized
-    scores = embeddings @ query_embedding
+    # Cosine similarity because both sides
+    # are L2 normalized.
+    scores = database_embeddings @ query_embedding
 
-    indices = np.argsort(scores)[::-1][:top_k]
+    # Get more candidates first.
+    candidate_count = min(
+        top_k * 3,
+        len(scores)
+    )
+
+    candidate_indices = np.argpartition(
+        scores,
+        -candidate_count
+    )[-candidate_count:]
+
+    # Sort candidates properly.
+    candidate_indices = candidate_indices[
+        np.argsort(
+            scores[candidate_indices]
+        )[::-1]
+    ]
 
     results = []
 
-    for index in indices:
+    seen_ids = set()
 
-        card = metadata.iloc[index].copy()
+    for index in candidate_indices:
 
-        results.append({
-            "id": card["id"],
-            "name": card["name"],
-            "desc": card["desc"],
-            "image_url": card["image_url"],
-            "similarity": float(scores[index])
-        })
+        row = metadata.iloc[index]
+
+        card_id = str(
+            row.get("id", index)
+        )
+
+        # Avoid accidental duplicates.
+        if card_id in seen_ids:
+            continue
+
+        seen_ids.add(card_id)
+
+        results.append(
+            {
+                "index": index,
+                "id": row.get("id", ""),
+                "name": row.get("name", "Unknown card"),
+                "desc": row.get("desc", ""),
+                "image_url": row.get("image_url", ""),
+                "score": float(scores[index])
+            }
+        )
+
+        if len(results) >= top_k:
+            break
 
     return results
 
 
-# =========================
-# Load model/database
-# =========================
+# ============================================================
+# CONFIDENCE
+# ============================================================
+
+def get_confidence(results):
+
+    if not results:
+        return "🔴 No match"
+
+    best = results[0]["score"]
+
+    if len(results) >= 2:
+
+        second = results[1]["score"]
+
+        gap = best - second
+
+    else:
+
+        gap = 0
+
+    # These are heuristic levels, not probabilities.
+    if best >= 0.90 and gap >= 0.025:
+
+        return "🟢 Very strong match"
+
+    if best >= 0.82 and gap >= 0.015:
+
+        return "🟢 Strong match"
+
+    if best >= 0.75:
+
+        return "🟡 Possible match"
+
+    return "🟠 Low confidence"
+
+
+# ============================================================
+# LOAD EVERYTHING
+# ============================================================
 
 try:
 
-    with st.spinner("Loading AI model..."):
+    with st.spinner(
+        "Loading Yu-Gi-Oh! AI model..."
+    ):
+
         model, processor, device = load_model()
 
-    embeddings, metadata = load_database()
+        database_embeddings, metadata = load_database()
 
-except Exception as e:
+except Exception as error:
 
-    st.error("The application could not load the AI model or database.")
+    st.error(
+        "The application could not load correctly."
+    )
 
-    st.code(str(e))
+    st.code(
+        str(error)
+    )
 
     st.stop()
 
 
-# =========================
-# Sidebar
-# =========================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 with st.sidebar:
 
-    st.header("Settings")
+    st.header("⚙️ Settings")
 
     top_k = st.slider(
-        "Number of matches",
-        1,
-        10,
-        5
+        "Number of results",
+        min_value=3,
+        max_value=10,
+        value=5
+    )
+
+    st.divider()
+
+    st.write(
+        f"**Cards indexed:** "
+        f"{len(metadata):,}"
     )
 
     st.write(
-        f"**Cards indexed:** {len(metadata):,}"
+        f"**Embedding dimensions:** "
+        f"{database_embeddings.shape[1]}"
     )
 
     st.write(
-        f"**Embedding size:** {embeddings.shape[1]}"
+        f"**Device:** `{device}`"
     )
 
-    st.write(
-        f"**Device:** {device}"
+    st.divider()
+
+    st.caption(
+        "The matcher uses multiple image views "
+        "to make results more stable."
     )
 
 
-# =========================
-# Upload
-# =========================
+# ============================================================
+# UPLOAD
+# ============================================================
 
 uploaded_file = st.file_uploader(
-    "Upload a card image",
+    "📷 Upload a Yu-Gi-Oh! card photo",
     type=[
         "jpg",
         "jpeg",
@@ -227,82 +464,166 @@ uploaded_file = st.file_uploader(
 )
 
 
-# =========================
-# Run search
-# =========================
+# ============================================================
+# SEARCH
+# ============================================================
 
-if uploaded_file:
+if uploaded_file is not None:
 
-    image = Image.open(
-        uploaded_file
-    ).convert("RGB")
+    try:
 
-    st.subheader("Your Card")
+        image = Image.open(
+            uploaded_file
+        ).convert("RGB")
 
-    st.image(
-        image,
-        width=300
-    )
+    except Exception:
 
-    with st.spinner("Searching 2,000 cards..."):
-
-        results = search_cards(
-            image,
-            embeddings,
-            metadata,
-            model,
-            processor,
-            device,
-            top_k
+        st.error(
+            "Could not read this image."
         )
 
+        st.stop()
 
-    # =========================
-    # Best match
-    # =========================
+    # --------------------------------------------------------
+    # Display uploaded card
+    # --------------------------------------------------------
 
-    best = results[0]
-
-    st.divider()
-
-    st.subheader("🎯 Best Match")
-
-    col1, col2 = st.columns(
+    left, right = st.columns(
         [1, 2]
     )
 
-    with col1:
+    with left:
 
-        if pd.notna(best["image_url"]):
+        st.subheader(
+            "📷 Uploaded card"
+        )
 
-            st.image(
-                best["image_url"],
-                width=250
+        st.image(
+            image,
+            width=280
+        )
+
+    with right:
+
+        st.subheader(
+            "🔍 Searching..."
+        )
+
+        with st.spinner(
+            "Comparing multiple views against 2,000 cards..."
+        ):
+
+            results = search_cards(
+                image,
+                database_embeddings,
+                metadata,
+                model,
+                processor,
+                device,
+                top_k
             )
 
-    with col2:
+        if not results:
+
+            st.error(
+                "No cards were found."
+            )
+
+            st.stop()
+
+        confidence = get_confidence(
+            results
+        )
+
+        best = results[0]
+
+        st.success(
+            confidence
+        )
+
+        st.metric(
+            "Best similarity",
+            f"{best['score'] * 100:.2f}%"
+        )
+
+
+    # ========================================================
+    # BEST MATCH
+    # ========================================================
+
+    st.divider()
+
+    st.header(
+        "🎯 Best Match"
+    )
+
+    best_col1, best_col2 = st.columns(
+        [1, 2]
+    )
+
+    with best_col1:
+
+        image_url = best["image_url"]
+
+        if (
+            isinstance(image_url, str)
+            and image_url.startswith(
+                ("http://", "https://")
+            )
+        ):
+
+            try:
+
+                st.image(
+                    image_url,
+                    width=300
+                )
+
+            except Exception:
+
+                st.warning(
+                    "Card image could not be loaded."
+                )
+
+    with best_col2:
 
         st.markdown(
             f"## {best['name']}"
         )
 
-        st.metric(
-            "Similarity",
-            f"{best['similarity'] * 100:.2f}%"
+        st.write(
+            f"**Similarity:** "
+            f"{best['score'] * 100:.2f}%"
         )
 
-        if pd.notna(best["desc"]):
+        st.write(
+            f"**Card ID:** `{best['id']}`"
+        )
 
-            st.write(best["desc"])
+        if (
+            isinstance(best["desc"], str)
+            and best["desc"].strip()
+        ):
+
+            st.write(
+                best["desc"]
+            )
 
 
-    # =========================
-    # Other matches
-    # =========================
+    # ========================================================
+    # OTHER MATCHES
+    # ========================================================
 
     st.divider()
 
-    st.subheader("🔎 Other Possible Matches")
+    st.header(
+        "🔎 Other likely matches"
+    )
+
+    st.caption(
+        "If the first result is incorrect, "
+        "check these alternatives."
+    )
 
     columns = st.columns(
         min(5, len(results))
@@ -315,33 +636,65 @@ if uploaded_file:
 
         with column:
 
-            if pd.notna(result["image_url"]):
+            image_url = result["image_url"]
 
-                st.image(
-                    result["image_url"],
-                    use_container_width=True
+            if (
+                isinstance(image_url, str)
+                and image_url.startswith(
+                    ("http://", "https://")
                 )
+            ):
+
+                try:
+
+                    st.image(
+                        image_url,
+                        use_container_width=True
+                    )
+
+                except Exception:
+
+                    st.write(
+                        "Image unavailable"
+                    )
 
             st.markdown(
                 f"**{result['name']}**"
             )
 
             st.write(
-                f"{result['similarity'] * 100:.2f}% match"
+                f"{result['score'] * 100:.2f}%"
             )
 
-            if pd.notna(result["desc"]):
+            if (
+                isinstance(result["desc"], str)
+                and result["desc"].strip()
+            ):
 
                 with st.expander(
-                    "Card Effect"
+                    "Card effect"
                 ):
 
                     st.write(
                         result["desc"]
                     )
 
+
 else:
 
     st.info(
-        "👆 Upload a Yu-Gi-Oh! card image to begin."
+        "👆 Upload a Yu-Gi-Oh! card image to start."
+    )
+
+    st.markdown(
+        """
+        ### Tips for better recognition
+
+        - Photograph the **entire card**.
+        - Keep the card reasonably straight.
+        - Avoid strong glare/reflections.
+        - Use good lighting.
+        - Avoid covering the card name.
+        - Higher-resolution photos usually work better.
+        """
     )

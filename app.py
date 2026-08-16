@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -6,120 +5,343 @@ import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
+
+# =========================
+# Configuration
+# =========================
+
+EMBEDDINGS_PATH = "embeddings.npy"
+DATABASE_PATH = "embedding_db.csv"
+
+MODEL_NAME = "openai/clip-vit-base-patch32"
+
+
+# =========================
+# Page
+# =========================
+
 st.set_page_config(
     page_title="Yu-Gi-Oh! AI Card Finder",
     page_icon="🃏",
-    layout="wide",
+    layout="wide"
 )
 
-MODEL_NAME = os.getenv("CLIP_MODEL", "openai/clip-vit-base-patch32")
-EMBEDDINGS_PATH = os.getenv("EMBEDDINGS_PATH", "model/embeddings.npy")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "model/embedding_db.csv")
-IMAGE_DIR = os.getenv("IMAGE_DIR", "data/images")
+st.title("🃏 Yu-Gi-Oh! AI Card Finder")
+st.write(
+    "Upload a Yu-Gi-Oh! card image and find the closest matching cards."
+)
+
+
+# =========================
+# Load CLIP
+# =========================
 
 @st.cache_resource
 def load_model():
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
+
+    model = CLIPModel.from_pretrained(MODEL_NAME)
     processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+
+    model = model.to(device)
     model.eval()
+
     return model, processor, device
 
-@st.cache_data
-def load_index():
-    embeddings = np.load(EMBEDDINGS_PATH)
-    db = pd.read_csv(DATABASE_PATH)
-    if len(embeddings) != len(db):
-        raise ValueError(
-            f"Index mismatch: {len(embeddings)} embeddings vs {len(db)} database rows."
-        )
-    return embeddings, db
 
-def encode_image(image, model, processor, device):
+# =========================
+# Load index
+# =========================
+
+@st.cache_data
+def load_database():
+
+    embeddings = np.load(EMBEDDINGS_PATH)
+    metadata = pd.read_csv(DATABASE_PATH)
+
+    if len(embeddings) != len(metadata):
+        raise ValueError(
+            f"Embeddings ({len(embeddings)}) and "
+            f"metadata ({len(metadata)}) do not match."
+        )
+
+    # Make sure embeddings are normalized
+    norms = np.linalg.norm(
+        embeddings,
+        axis=1,
+        keepdims=True
+    )
+
+    embeddings = embeddings / np.maximum(norms, 1e-12)
+
+    return embeddings, metadata
+
+
+# =========================
+# Encode uploaded image
+# =========================
+
+def encode_image(
+    image,
+    model,
+    processor,
+    device
+):
+
     image = image.convert("RGB")
-    inputs = processor(images=image, return_tensors="pt").to(device)
+
+    inputs = processor(
+        images=image,
+        return_tensors="pt"
+    )
+
+    inputs = {
+        key: value.to(device)
+        for key, value in inputs.items()
+    }
+
     with torch.no_grad():
-        output = model.get_image_features(**inputs)
-        if hasattr(output, "image_embeds"):
-            embedding = output.image_embeds
-        elif hasattr(output, "pooler_output"):
-            embedding = output.pooler_output
-        else:
-            embedding = output
-        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+
+        embedding = model.get_image_features(
+            **inputs
+        )
+
+        if hasattr(embedding, "image_embeds"):
+            embedding = embedding.image_embeds
+
+        elif hasattr(embedding, "pooler_output"):
+            embedding = embedding.pooler_output
+
+        embedding = embedding / embedding.norm(
+            dim=-1,
+            keepdim=True
+        )
+
     return embedding.cpu().numpy()[0]
 
-def predict_card(image, embeddings, db, model, processor, device, top_k=5):
-    query = encode_image(image, model, processor, device)
-    similarities = embeddings @ query
-    top_indices = np.argsort(similarities)[::-1][:top_k]
+
+# =========================
+# Search
+# =========================
+
+def search_cards(
+    image,
+    embeddings,
+    metadata,
+    model,
+    processor,
+    device,
+    top_k
+):
+
+    query_embedding = encode_image(
+        image,
+        model,
+        processor,
+        device
+    )
+
+    # Cosine similarity because vectors are normalized
+    scores = embeddings @ query_embedding
+
+    indices = np.argsort(scores)[::-1][:top_k]
 
     results = []
-    for idx in top_indices:
-        row = db.iloc[idx]
-        result = row.to_dict()
-        result["similarity"] = float(similarities[idx])
-        results.append(result)
+
+    for index in indices:
+
+        card = metadata.iloc[index].copy()
+
+        results.append({
+            "id": card["id"],
+            "name": card["name"],
+            "desc": card["desc"],
+            "image_url": card["image_url"],
+            "similarity": float(scores[index])
+        })
+
     return results
 
-st.title("🃏 Yu-Gi-Oh! AI Card Finder")
-st.write("Upload a Yu-Gi-Oh! card image and find the closest cards in the indexed database.")
 
-with st.sidebar:
-    st.header("Settings")
-    top_k = st.slider("Number of matches", 1, 10, 5)
-    st.caption("Similarity is cosine similarity from CLIP image embeddings.")
+# =========================
+# Load model/database
+# =========================
 
 try:
-    model, processor, device = load_model()
-    embeddings, db = load_index()
+
+    with st.spinner("Loading AI model..."):
+        model, processor, device = load_model()
+
+    embeddings, metadata = load_database()
+
 except Exception as e:
-    st.error("The model/index files are not ready yet.")
+
+    st.error("The application could not load the AI model or database.")
+
     st.code(str(e))
-    st.info(
-        "Run build_index.py first, then place embeddings.npy and embedding_db.csv "
-        "under model/."
-    )
+
     st.stop()
 
-uploaded = st.file_uploader(
-    "Upload card image",
-    type=["jpg", "jpeg", "png", "webp"],
+
+# =========================
+# Sidebar
+# =========================
+
+with st.sidebar:
+
+    st.header("Settings")
+
+    top_k = st.slider(
+        "Number of matches",
+        1,
+        10,
+        5
+    )
+
+    st.write(
+        f"**Cards indexed:** {len(metadata):,}"
+    )
+
+    st.write(
+        f"**Embedding size:** {embeddings.shape[1]}"
+    )
+
+    st.write(
+        f"**Device:** {device}"
+    )
+
+
+# =========================
+# Upload
+# =========================
+
+uploaded_file = st.file_uploader(
+    "Upload a card image",
+    type=[
+        "jpg",
+        "jpeg",
+        "png",
+        "webp"
+    ]
 )
 
-if uploaded:
-    image = Image.open(uploaded).convert("RGB")
 
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.image(image, caption="Uploaded card", use_container_width=True)
+# =========================
+# Run search
+# =========================
 
-    with st.spinner("Searching the card database..."):
-        results = predict_card(
-            image, embeddings, db, model, processor, device, top_k
+if uploaded_file:
+
+    image = Image.open(
+        uploaded_file
+    ).convert("RGB")
+
+    st.subheader("Your Card")
+
+    st.image(
+        image,
+        width=300
+    )
+
+    with st.spinner("Searching 2,000 cards..."):
+
+        results = search_cards(
+            image,
+            embeddings,
+            metadata,
+            model,
+            processor,
+            device,
+            top_k
         )
 
+
+    # =========================
+    # Best match
+    # =========================
+
     best = results[0]
-    with col2:
-        st.subheader("Best match")
-        st.markdown(f"## {best.get('name', 'Unknown')}")
-        st.metric("CLIP similarity", f"{best['similarity'] * 100:.2f}%")
-        if best.get("desc"):
-            st.write(best["desc"])
 
     st.divider()
-    st.subheader("Other possible matches")
 
-    cols = st.columns(min(5, len(results)))
-    for col, result in zip(cols, results):
-        with col:
-            image_path = os.path.join(IMAGE_DIR, f"{result.get('id')}.jpg")
-            if os.path.exists(image_path):
-                st.image(image_path, use_container_width=True)
-            st.markdown(f"**{result.get('name', 'Unknown')}**")
-            st.write(f"{result['similarity'] * 100:.2f}%")
-            if result.get("desc"):
-                with st.expander("Effect"):
-                    st.write(result["desc"])
+    st.subheader("🎯 Best Match")
+
+    col1, col2 = st.columns(
+        [1, 2]
+    )
+
+    with col1:
+
+        if pd.notna(best["image_url"]):
+
+            st.image(
+                best["image_url"],
+                width=250
+            )
+
+    with col2:
+
+        st.markdown(
+            f"## {best['name']}"
+        )
+
+        st.metric(
+            "Similarity",
+            f"{best['similarity'] * 100:.2f}%"
+        )
+
+        if pd.notna(best["desc"]):
+
+            st.write(best["desc"])
+
+
+    # =========================
+    # Other matches
+    # =========================
+
+    st.divider()
+
+    st.subheader("🔎 Other Possible Matches")
+
+    columns = st.columns(
+        min(5, len(results))
+    )
+
+    for column, result in zip(
+        columns,
+        results
+    ):
+
+        with column:
+
+            if pd.notna(result["image_url"]):
+
+                st.image(
+                    result["image_url"],
+                    use_container_width=True
+                )
+
+            st.markdown(
+                f"**{result['name']}**"
+            )
+
+            st.write(
+                f"{result['similarity'] * 100:.2f}% match"
+            )
+
+            if pd.notna(result["desc"]):
+
+                with st.expander(
+                    "Card Effect"
+                ):
+
+                    st.write(
+                        result["desc"]
+                    )
+
 else:
-    st.info("Upload a card image above to start.")
+
+    st.info(
+        "👆 Upload a Yu-Gi-Oh! card image to begin."
+    )

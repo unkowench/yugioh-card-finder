@@ -4,4 +4,4 @@ pandas
 torch
 transformers
 Pillow
-sentencepiece
+easyocr
